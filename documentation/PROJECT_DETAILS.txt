@@ -1,0 +1,324 @@
+Drishti — Project Details
+Generated: 2026-05-05
+
+Overview
+--------
+This file consolidates the repository analysis, the extracted project report (DOCX), the implementation details of the frontend and backend, models used, data flows, endpoints, known issues and mitigations, run instructions, test commands, and recommended next steps. It was created by reading the workspace code and the included external DOCX file (Finallllllll-me.docx). The PDF extraction attempt failed during automated extraction (see Appendix B).
+
+**Very brief explanation (concise, one-paragraph)**
+Drishti is an assistive mobile/web application that helps visually impaired users by (1) identifying Indian currency denominations from a short video clip, (2) extracting and reading text from document and non-document images, and (3) sharing live location with trusted contacts. The frontend (Expo/React Native) records or uploads media and sends it to a Flask backend which isolates heavy ML inference—an EfficientNetB0-based Keras model for currency and a PyTorch-based OCR pipeline (CRAFT detector + TPS-ResNet recognizer) with Tesseract fallbacks—into subprocess workers to avoid OOMs. Key engineering choices include lazy imports, subprocess isolation, limiting native threads, and using `ffmpeg`/`tesseract` system binaries for robustness; typical API outputs are a short JSON prediction for currency (e.g., "The predicted currency note is 100 rupees") and plain extracted text for OCR endpoints.
+
+
+**Detailed explanation (Beginner-friendly)**
+This section explains the project assuming no prior knowledge. Read the short paragraph above for a one-line summary; the text below expands each part so you can understand how it works end-to-end.
+
+- What the app does (user view):
+  - Currency recognition: the user opens the Currency screen, records a short (≈3s) video of a banknote or uploads a video file. The app sends the video to the backend and the app speaks back the detected denomination (e.g., "100 rupees").
+  - Text reading (documents): the user points the camera at a printed page or uploads an image; the app sends the image and receives extracted text which it reads aloud.
+  - Text reading (non-doc / scene text): similar to documents but optimized for single words or stylized text found in the environment (labels, signs).
+  - Live location sharing: the user can add guardians and share their current location using the app; guardians receive a link (via email/SMS) to view the sender's location.
+
+- How the frontend works (technical but simple):
+  - Built with Expo / React Native so the same code runs on mobile (Android/iOS) and web. Key UI files are `screens/CurrencyRecognition.js` and `screens/TextDetection.js`.
+  - On the currency screen the app either records a short video (mobile camera API) or accepts a file (web file input). It uploads the media with a FormData field named `videoFile` to `POST /currency`.
+  - On text screens the app captures or picks an image and uploads it with the FormData field `file` to `POST /text-doc` (documents) or `POST /text-non-doc` (non-doc).
+  - The frontend expects JSON responses: currency returns `{ "prediction": "The predicted currency note is 100 rupees" }`; OCR returns `{ "Prediction": "<extracted text>", "success": "True" }`.
+
+- How the backend works (overview):
+  - The server is a Flask app (`backend/app.py`) that receives uploads, stores them in `backend/uploads` or `backend/final/images`, and orchestrates processing.
+  - Heavy ML work (TensorFlow/PyTorch) is done in separate subprocesses to avoid the Flask process importing big libraries at startup (this reduces memory spikes and crashes). Currency inference runs in `backend/currency_predict.py` and OCR runs in `final/OCR.py` (invoked via `python -m final.OCR ...`).
+  - For currency: the server extracts up to 8 frames from the uploaded video (balanced sampling), resizes to 224×224, normalizes pixels, and either calls the subprocess which loads the EfficientNet-based model and returns a JSON prediction, or, if the subprocess fails, performs an in-process fallback (lazy-load model) and majority-votes across frames.
+  - For OCR (documents): a fast path tries the system `tesseract` binary first (quick); if that doesn’t return usable text the server runs the heavier `final.OCR` pipeline as a subprocess (CRAFT + dewarp + recognizer). Diagnostics go to stderr; final text goes to stdout so the Flask wrapper can parse it reliably.
+
+- Currency model (how it was trained and how inference works):
+  - Model: EfficientNetB0 backbone pretrained on ImageNet, then a small top with GlobalAveragePooling, Dropout, and a Dense softmax head for 8 classes (10,20,50,100,200,500,2000,Background).
+  - Weights: saved to `backend/model_5.h5` and loaded by `currency_predict.py` or via in-process fallback in `app.py`.
+  - Inference: frames are read using OpenCV, converted BGR→RGB, resized to 224×224, pixel values normalized to [0,1], batched, and passed through the model. Predictions per-frame are reduced with majority vote (Counter) to choose the final denomination.
+
+- OCR pipeline (step-by-step):
+  1. Deskew: minor rotation correction to align text lines.
+  2. Dewarp: complex page un-warping for camera-captured book pages; `page_dewarp.py` builds a remap grid and writes a thresholded image for OCR. Numeric clamps were added to avoid huge remap outputs.
+  3. Detection: CRAFT detector finds word/polygon boxes (weights: `craft_mlt_25k.pth`).
+  4. Cropping & sorting: detected boxes are grouped into lines and merged; words are cropped into temporary files.
+  5. Recognition:
+     - Non-doc flow uses a deep recognizer (TPS-ResNet-BiLSTM-Attn) to read stylized words; expected weights live under `final/text_prediction_non_doc`.
+     - Document flow uses the system `tesseract` binary first (fast and often sufficient) and falls back to the recognizer or pytesseract wrappers when necessary.
+  6. Post-processing: spell correction and merging produce readable text in line order.
+
+- Why subprocesses and thread limits matter (practical explanation):
+  - TensorFlow and PyTorch can allocate large amounts of memory and spawn many native threads when imported. If done inside the Flask process the OS may kill the process (OOM). Running heavy models in subprocesses isolates memory and lets the server remain responsive. The server also restricts native threads (OMP_NUM_THREADS etc.) and sets `CUDA_VISIBLE_DEVICES=''` for CPU-only runs to reduce pressure.
+
+- System dependencies (what you must install):
+  - Python (3.8/3.9 recommended) + virtualenv; activate `backend/.venv`
+  - Core Python packages: TensorFlow, torch, torchvision, opencv-python, pillow, scipy, pytesseract, numpy. Use the provided `backend/requirements*.txt` as guidance.
+  - System binaries (macOS):
+    - `tesseract` (brew install tesseract)
+    - `ffmpeg` (brew install ffmpeg) — helpful for browser webm → mp4 transcode
+    - (Optional) `pdftotext` / `poppler` for PDF text extraction
+
+- How to run locally (quick start):
+```bash
+# 1) Backend venv
+cd backend
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements_final.txt   # or the requirements file you prefer
+
+# 2) Start backend (no Flask debug reloader)
+PYTHONUNBUFFERED=1 python backend/app.py
+
+# 3) Start frontend (from repo root)
+# If Node OpenSSL errors appear on some Node versions, use legacy provider
+NODE_OPTIONS=--openssl-legacy-provider npm run web
+```
+
+- Example tests (curl):
+```bash
+# OCR (document)
+curl -F "file=@backend/final/images/photo.jpg" http://127.0.0.1:5001/text-doc
+
+# Currency (video)
+curl -F "videoFile=@/path/to/short_video.mp4" http://127.0.0.1:5001/currency
+```
+
+- Common problems & quick fixes:
+  - "No tesseract found" → install system `tesseract` (brew install tesseract).
+  - OOM / killed processes when running OCR/currency → ensure subprocess isolation is enabled (code already does) and limit native threads via env vars; consider running model inference in a separate container or a persistent worker to avoid repeated startup costs.
+  - Web frontend fails with OpenSSL error → start with `NODE_OPTIONS=--openssl-legacy-provider npm run web`.
+
+- Where to look for the important files and logs:
+  - Uploads: `backend/uploads`
+  - Frames extracted for currency: `backend/frames/frames`
+  - Currency model weights: `backend/model_5.h5`
+  - OCR code and helpers: `backend/final/` (look into `OCR.py`, `page_dewarp`, `generate_bounding_box.py`)
+  - Subprocess debug logs are printed to stderr (Flask captures them in console where the server runs).
+
+- Next steps and improvements you might want to request:
+  - Add a persistent inference worker (HTTP/gRPC) so models load once and serve many requests.
+  - Containerize the backend and inference components, pin BLAS libraries, and set CPU/GPU limits.
+  - Add end-to-end tests and a small demo script that exercises currency and OCR flows automatically.
+
+Now that this detailed explanation is in the file, you can read the earlier sections for code references and the extracted DOCX content. If you'd like, I can also simplify this into a one-page quick-start or produce a diagram of the data flow.
+
+
+**High-level summary**
+- Purpose: a mobile/web assistive app named "Drishti" that helps visually impaired users by recognizing Indian currency, extracting and reading text (document and non-document), and sharing live location with guardians.
+- Tech stack: React Native / Expo (web), Flask backend (Python), OpenCV, TensorFlow/Keras (EfficientNetB0-based currency model), PyTorch (CRAFT detector + TPS-ResNet recognizer for non-doc OCR), Tesseract system binary and pytesseract fallback, ffmpeg (video transcode).
+
+Repository pointers
+- Frontend screens: screens/CurrencyRecognition.js, screens/TextDetection.js
+- Frontend constants: constants/constants.js (dynamically resolves backend host)
+- Backend entrypoint: backend/app.py
+- Currency worker: backend/currency_predict.py
+- Currency model weights: backend/model_5.h5
+- OCR pipeline: backend/final/OCR.py and modules under backend/final/
+- Page dewarp: backend/final/page_dewarp/page_dewarp.py (stability clamps added)
+- CRAFT weights: backend/final/craft_mlt_25k.pth
+- Non-doc recognizer expected weights: backend/final/text_prediction_non_doc/TPS-ResNet-BiLSTM-Attn.pth
+
+Architecture & Data Flow
+------------------------
+Frontend (Expo / React Native web)
+- CurrencyRecognition.js: records a 3s video (or accepts an uploaded video on web). The video is uploaded to `POST /currency` as `videoFile`. The screen speaks the returned prediction.
+- TextDetection.js: captures an image (camera or gallery) and uploads as `file` to `POST /text-doc` or `POST /text-non-doc` depending on `props.route.params.type`.
+- Backend host selection is dynamic via `constants/constants.js` which uses `window.location.hostname` for web.
+
+Backend (Flask)
+- Runs on port 5001 by default (app.run host=0.0.0.0, port=5001).
+- Key endpoints:
+  - `POST /currency` — accepts `videoFile`, saves to `backend/uploads`, extracts up to 8 frames using OpenCV, and then invokes `currency_predict.py` as a subprocess (to isolate TensorFlow/Keras imports and avoid OOMs). The subprocess prints final JSON like {"prediction":"100"}. The Flask wrapper parses stdout/stderr robustly, normalizes the label and returns: `{"prediction":"The predicted currency note is <n> rupees"}` or a helpful message on background/no-detection.
+  - `POST /text-doc` — accepts `file` (document image). Quick path: runs the system `tesseract` binary (PSM 6,3,1) first; if that yields reasonable text it returns it. Else runs `final.OCR` as a subprocess with environment limits (OMP_NUM_THREADS=1, MKL_NUM_THREADS=1, OPENBLAS_NUM_THREADS=1, NUMEXPR_NUM_THREADS=1, VECLIB_MAXIMUM_THREADS=1 and `CUDA_VISIBLE_DEVICES=''`) to reduce native-thread/GPU pressure. If subprocess fails, server attempts `final.Tesseract_test.call_tesseract()` and then the system binary as last resort.
+  - `POST /text-non-doc` — saves image and calls `final.OCR.ocr_non_doc` (lazy-imported) which uses CRAFT for boxes and TPS-ResNet-BiLSTM-Attn recognizer to produce words; results are spell-corrected and returned.
+  - `POST /update-location`, `POST /send-location`, `GET /get-location` — location tracking and email/SMS notifications. SMTP credentials can be configured via env vars `DRISHTI_SMTP_USER` / `DRISHTI_SMTP_PASS`.
+
+Model details
+-------------
+Currency recognition
+- Architecture: EfficientNetB0 (imagenet weights) backbone + GlobalAveragePooling2D + Dropout(0.5) + Dense(n_classes=8, softmax).
+- Optimizer used during training: Adam lr=1e-4 (in code) — training happened in Colab (not included here); training notebooks live under `Currency Note Recognition/Training`.
+- Weights: `backend/model_5.h5` (used by `currency_predict.py` and `app.py` fallback in-process loader). Label mapping used in code: {0:'10', 1:'100', 2:'20', 3:'200', 4:'2000', 5:'50', 6:'500', 7:'Background'}.
+
+OCR stack
+- Detection: CRAFT detector (weights: `backend/final/craft_mlt_25k.pth`). Detector finds word/polygon regions.
+- Page processing: `backend/final/page_dewarp/page_dewarp.py` — deskews and dewarps pages (clamps numeric outputs to avoid runaway remap sizes). This module writes thresholded temporary files and returns filenames for cropping and OCR.
+- Recognition: two paths
+  - Non-document (stylized or scene text): TPS-ResNet-BiLSTM-Attn recognizer (expected weights: `backend/final/text_prediction_non_doc/TPS-ResNet-BiLSTM-Attn.pth`) used by `final/text_prediction_non_doc/demo.py`.
+  - Document text: system `tesseract` binary (fast path) or pytesseract wrapper via `Tesseract_test.py` as fallback.
+- Post-processing: `Spell_Check.SpellCorrection` and `merge_n_sort.group_text_box` to combine and order words into readable strings.
+
+Worker isolation and memory safety
+---------------------------------
+- Heavy ML libraries (TensorFlow, PyTorch) are NOT imported at Flask startup. The app uses lazy imports and subprocess workers: `currency_predict.py` for currency and `final.OCR` as a subprocess for OCR.
+- Subprocess invocation sets environment variables to limit native threads and hides CUDA devices (set `CUDA_VISIBLE_DEVICES=''`) to reduce memory pressure.
+- Page dewarp numerical stability: `page_dewarp` clamps `page_dims` and remap sizes (MAX_PAGE_DIM / MAX_ALLOWED_WIDTH / height caps) to prevent runaway allocation that previously caused OOMs (kill -9 / exit 137).
+- stdout/stderr discipline: subprocesses are expected to print machine-readable results (final recognized string or JSON) to stdout; diagnostic logs are written to stderr so the Flask wrapper can reliably parse output.
+
+Files to check (key locations)
+- Backend entry: [backend/app.py](backend/app.py#L1-L1)
+- Currency worker: [backend/currency_predict.py](backend/currency_predict.py#L1-L1)
+- Currency weights: [backend/model_5.h5](backend/model_5.h5)
+- OCR main: [backend/final/OCR.py](backend/final/OCR.py#L1-L1)
+- Dewarp: [backend/final/page_dewarp/page_dewarp.py](backend/final/page_dewarp/page_dewarp.py#L1-L1)
+- CRAFT weights: [backend/final/craft_mlt_25k.pth](backend/final/craft_mlt_25k.pth)
+- Non-doc recognizer (expected): [backend/final/text_prediction_non_doc/TPS-ResNet-BiLSTM-Attn.pth](backend/final/text_prediction_non_doc/TPS-ResNet-BiLSTM-Attn.pth)
+- Frontend currency UI: [screens/CurrencyRecognition.js](screens/CurrencyRecognition.js#L1-L1)
+- Frontend text UI: [screens/TextDetection.js](screens/TextDetection.js#L1-L1)
+
+Run & troubleshooting (quick commands)
+-------------------------------------
+Backend (from repo root)
+```bash
+cd backend
+source .venv/bin/activate
+# run without Flask debug reloader to avoid duplicate processes during ML work
+PYTHONUNBUFFERED=1 python backend/app.py
+```
+
+Frontend (Expo web)
+```bash
+# On macOS if you hit OpenSSL errors with local Node, use legacy provider
+NODE_OPTIONS=--openssl-legacy-provider npm run web
+```
+
+Test examples (curl)
+```bash
+# OCR (document image)
+curl -v -F "file=@backend/final/images/photo.jpg" http://127.0.0.1:5001/text-doc
+
+# Currency (video file -- webm/mp4). If you upload webm, install ffmpeg or let server transcode
+curl -v -F "videoFile=@/path/to/video.mp4" http://127.0.0.1:5001/currency
+```
+
+Notes on environment & prerequisites
+-----------------------------------
+- Python virtualenv: backend/.venv (activate before running the app). Key Python packages: TensorFlow, PyTorch, OpenCV, pillow, scipy, pytesseract; some are heavy.
+- System binaries: `tesseract` (recommended) and `ffmpeg` (useful for browser webm uploads). Install via `brew install tesseract ffmpeg` on macOS.
+- If the OCR PDF extractor is needed locally, install `PyPDF2` or `pdftotext`.
+
+Known issues and current mitigations
+-----------------------------------
+- OOM / exit 137 when importing TF/PyTorch in the main process: mitigated by subprocess isolation and limiting native threads (`OMP_NUM_THREADS`, etc.). For further robustness use a persistent worker process or a separate inference service (Docker or separate host).
+- page_dewarp numeric instability could produce enormous remap arrays — clamped in code using MAX_PAGE_DIM and sensible aspect checks.
+- Subprocess stdout polluted by debug prints can break JSON parsing — we moved diagnostics to stderr in major modules so Flask can parse final JSON/text reliably.
+- Expo web: OpenSSL errors (`error:0308010C:digital envelope routines::unsupported`) appear on some Node versions — fix with `NODE_OPTIONS=--openssl-legacy-provider`.
+- Email sending: default credentials are present in code for convenience but insecure; configure `DRISHTI_SMTP_USER` and `DRISHTI_SMTP_PASS` environment variables.
+
+Recommendations & next steps
+----------------------------
+- Run a persistent inference worker (gRPC/HTTP) for currency and OCR rather than spawning a new Python interpreter per request. This saves repeated model loading and reduces transient memory churn.
+- Containerize inference in a lightweight Docker image with pinned native BLAS libraries and explicit CPU/GPU limits.
+- Add a small integration test suite (curl-based) for the key endpoints and a CI job to run them in a lightweight environment.
+- Add simple health-check endpoints for the worker process and memory usage alerts.
+
+Appendix A — Extracted DOCX (Finallllllll-me.docx) — excerpt
+----------------------------------------------------------------
+The project report embedded in `documentation/external_docs/Finallllllll-me.docx` was read and a text extraction was performed. Key excerpts follow (Abstract, Objectives, Methods summary):
+
+--- Abstract (excerpt) ---
+Visually impaired individuals encounter numerous challenges in their daily lives, extending beyond simply recognizing currency notes. The difficulty in distinguishing between different denominations due to similarities in texture and size highlights the necessity for a practical solution. Moreover, the scarcity of braille-printed materials in public libraries and educational institutions limits educational opportunities, isolating visually impaired individuals from essential learning resources. Navigating unfamiliar environments poses risks, while difficulty in reading printed text hinders access to crucial information in books, newspapers, and other sources.
+
+To address these challenges, this project aims to provide a comprehensive solution tailored to the needs of the visually impaired. The development of a currency recognition system utilizing live video input seeks to empower individuals by accurately announcing denominations, promoting financial independence and confidence in managing money. Additionally, integrating a text-to-audio conversion feature for live images aims to bridge the gap in accessing printed materials, thereby enhancing educational and informational opportunities. Furthermore, including a real-time location-sharing feature not only addresses safety concerns but also promotes independence by enabling visually impaired individuals to share their location with loved ones for assistance and peace of mind.
+
+The app successfully scans Indian currency notes, empowering blind users in financial transactions. It accurately detects documents and non-documents, facilitating access to vital information. Live location sharing ensures swift assistance from loved ones when needed. These features enhance independence and safety for blind individuals in India.
+
+--- Methods and Tools (excerpt) ---
+Tools/Tech: React Native (Expo), Flask, TensorFlow (Keras), PyTorch, OpenCV, Tesseract, ffmpeg, Jupyter/Colab for training. Currency model training and experiments reported high accuracy with EfficientNet-based architectures and augmentation; OCR pipeline combines deskew/dewarp, CRAFT detector, TPS-ResNet recognizer and spell-correction.
+
+Appendix B — PDF extraction status
+----------------------------------
+The included PDF (`documentation/external_docs/Empowering Independence_ A Solution for the Visually Impaired - CHIRAG.pdf`) was detected in the repository but automated extraction failed in this environment because `PyPDF2` was not available and `pdftotext` was not found. The PDF remains in the repo at:
+
+- documentation/external_docs/Empowering Independence_ A Solution for the Visually Impaired - CHIRAG.pdf
+
+To extract the PDF into plain text locally, install one of:
+```bash
+# preferred: install poppler and use pdftotext (macOS)
+brew install poppler
+pdftotext -layout "documentation/external_docs/Empowering Independence_ A Solution for the Visually Impaired - CHIRAG.pdf" -
+
+# or install PyPDF2 in the Python venv
+source backend/.venv/bin/activate
+pip install PyPDF2
+python -c "import PyPDF2; print('ready')"
+```
+
+Closing notes
+-------------
+I wrote this consolidated report by reading the codebase and extracting the DOCX report present in `documentation/external_docs`. The file summarizes models, flows, endpoints, run steps, and mitigations implemented to reduce OOM risk. If you want, I can:
+- extract the PDF text (I can run pdftotext or install PyPDF2 in your venv and re-run extraction),
+- create a smaller README summary per component, or
+- implement a persistent worker or Dockerfile for the inference components.
+
+Email & SMS configuration
+-------------------------
+This project supports two mail/SMS delivery options from the backend:
+
+- SMTP (Gmail) using `DRISHTI_MAIL_PROVIDER=smtp` (requires `DRISHTI_SMTP_USER` and `DRISHTI_SMTP_PASS` environment variables). We recommend creating a Gmail "App password" rather than using your primary account password.
+- SendGrid (API) via `DRISHTI_MAIL_PROVIDER=sendgrid` with `DRISHTI_SENDGRID_API_KEY` and `DRISHTI_SENDGRID_FROM`. Optional SMS via Twilio is supported when `DRISHTI_TWILIO_*` vars are set.
+
+Create a Gmail App Password (macOS / general browser steps):
+1. Sign in to your Google Account at https://myaccount.google.com.
+2. Go to "Security" → enable "2-Step Verification" (if not already enabled).
+3. After 2-Step is enabled, return to "Security" → "App passwords".
+4. Select "Mail" as the app and choose "Other (Custom name)" for device; enter a name like "Drishti Backend" and click Generate.
+5. Google shows a 16-character app password — copy it; this is the value to use for `DRISHTI_SMTP_PASS`.
+
+Set environment variables (temporary, zsh/bash) and restart the backend:
+```bash
+export DRISHTI_MAIL_PROVIDER=smtp
+export DRISHTI_SMTP_USER="your.email@gmail.com"
+export DRISHTI_SMTP_PASS="<your-16-char-app-password>"
+# optional: email-to-sms gateway domain (carrier-specific) if you want SMS via SMTP
+export DRISHTI_SMS_GATEWAY="tmomail.net"
+
+# Restart backend (example):
+pids=$(lsof -ti tcp:5001) && [ -n "$pids" ] && kill -9 $pids || true
+sleep 1
+PYTHONUNBUFFERED=1 backend/.venv/bin/python backend/app.py
+```
+
+Or run inline for a single invocation:
+```bash
+DRISHTI_MAIL_PROVIDER=smtp DRISHTI_SMTP_USER=your.email@gmail.com DRISHTI_SMTP_PASS=app_password PYTHONUNBUFFERED=1 backend/.venv/bin/python backend/app.py
+```
+
+SendGrid + Twilio (recommended for production):
+```bash
+# use SendGrid for email delivery
+export DRISHTI_MAIL_PROVIDER=sendgrid
+export DRISHTI_SENDGRID_API_KEY="SG.xxxxx"
+export DRISHTI_SENDGRID_FROM="no-reply@yourdomain.com"
+
+# optional Twilio for SMS
+export DRISHTI_TWILIO_SID="ACxxxxxxxxxxxxxxxx"
+export DRISHTI_TWILIO_TOKEN="your_twilio_token"
+export DRISHTI_TWILIO_FROM="+1234567890"
+```
+
+How to test the send-location endpoint once env vars are set:
+```bash
+curl -v -X POST -H "Content-Type: application/json" \
+  -d '{"emailList":[{"name":"Test","email":"recipient@example.com","phone":"9999999999"}]}' \
+  http://127.0.0.1:5001/send-location
+```
+
+If email delivery fails, check the backend logs (console where `backend/app.py` is running) — the server prints lines like `send-location: incoming payload:` and `send-location: recipients:` to help debug. Do not commit secret values to the repo; use a `.env` file or your system's secret manager for production.
+
+Persisting environment variables with a `.env` file
+--------------------------------------------------
+This project will automatically load environment variables from either `backend/.env` or a top-level `.env` file in the repository root when the server starts. To persist values locally, copy `.env.example` (at the repo root) to `.env`, fill in your credentials, and restart the backend. Example steps:
+
+```bash
+# copy example and edit
+cp .env.example .env
+# edit .env and set your DRISHTI_SMTP_USER / DRISHTI_SMTP_PASS or SendGrid/Twilio vars
+# then restart the backend
+pids=$(lsof -ti tcp:5001) && [ -n "$pids" ] && kill -9 $pids || true
+sleep 1
+PYTHONUNBUFFERED=1 backend/.venv/bin/python backend/app.py
+```
+
+Security reminder: keep `.env` out of version control. Add `.env` to your `.gitignore` if not already ignored.
+
+
+
